@@ -32,6 +32,15 @@ from flask import Flask
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
+# Upstash Redis (REST API) — хранит состояние дедупликации алертов (какие монеты уже
+# считались всплеском, когда последний раз слался алерт по каждой) во внешнем месте,
+# которое переживает перезапуск процесса. Без этого при каждом деплое/перезапуске на
+# Render бот "забывает" свою память и может прислать повторные алерты по тем же монетам.
+UPSTASH_REDIS_URL = os.environ.get("UPSTASH_REDIS_URL", "").rstrip("/")
+UPSTASH_REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_TOKEN", "")
+REDIS_KEY_ALERTED = "cryptoscan:burst_alerted_syms"
+REDIS_KEY_COOLDOWN = "cryptoscan:burst_alert_cooldown"
+
 # Параметры всплеска — совпадают с теми, что в самом скринере
 BURST_WINDOW_MIN = 30          # окно поиска всплеска (минут)
 BURST_MIN_CANDLES = 10         # минимум "горячих" свечей в этом окне
@@ -52,7 +61,8 @@ ALERT_COOLDOWN_SEC = 60 * 60    # не слать повторный алерт 
 # вместе с авто-фильтром, а не вместо него.
 EXCLUDED_SYMBOLS = {
     "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "TRX", "AVAX", "LINK",
-    "PAXG", "XAUT",  # токенизированное золото
+    "PAXG", "XAUT", "XAU", "XAG",  # золото, серебро (включая товарные перпетуалы)
+    "CL", "BRENT", "WTI", "NG",  # нефть, природный газ
     "FDUSD", "USDC", "USDT", "TUSD", "DAI", "BUSD",  # стейблкоины
 }
 
@@ -66,10 +76,61 @@ logging.basicConfig(
 log = logging.getLogger("burst-bot")
 
 # Состояние между циклами: какие монеты уже считались всплеском, и когда последний
-# раз отправлялся алерт по каждой монете
+# раз отправлялся алерт по каждой монете. Хранится локально в памяти процесса как
+# кэш, но синхронизируется с Upstash Redis (если он настроен), чтобы переживать
+# перезапуск процесса.
 burst_alerted_syms: set[str] = set()
 burst_alert_cooldown: dict[str, float] = {}
 last_cycle_summary = "Бот запущен, первый цикл ещё не завершён"
+_redis_loaded = False  # подгружали ли мы состояние из Redis после старта процесса
+
+
+def _redis_configured() -> bool:
+    return bool(UPSTASH_REDIS_URL and UPSTASH_REDIS_TOKEN)
+
+
+def _redis_headers() -> dict:
+    return {"Authorization": f"Bearer {UPSTASH_REDIS_TOKEN}"}
+
+
+def redis_load_state() -> None:
+    """Подгружает burst_alerted_syms и burst_alert_cooldown из Upstash Redis при старте
+    процесса — это и есть защита от повторных алертов после перезапуска/редеплоя."""
+    global burst_alerted_syms, burst_alert_cooldown, _redis_loaded
+    if not _redis_configured():
+        log.warning(
+            "UPSTASH_REDIS_URL/UPSTASH_REDIS_TOKEN не заданы — состояние дедупликации "
+            "не персистентно и сбросится при следующем перезапуске процесса. См. README.md."
+        )
+        _redis_loaded = True
+        return
+    try:
+        r1 = requests.get(f"{UPSTASH_REDIS_URL}/get/{REDIS_KEY_ALERTED}", headers=_redis_headers(), timeout=10)
+        r2 = requests.get(f"{UPSTASH_REDIS_URL}/get/{REDIS_KEY_COOLDOWN}", headers=_redis_headers(), timeout=10)
+        alerted_raw = r1.json().get("result") if r1.ok else None
+        cooldown_raw = r2.json().get("result") if r2.ok else None
+        import json as _json
+        burst_alerted_syms = set(_json.loads(alerted_raw)) if alerted_raw else set()
+        burst_alert_cooldown = _json.loads(cooldown_raw) if cooldown_raw else {}
+        log.info(f"Состояние дедупликации загружено из Redis: {len(burst_alerted_syms)} активных всплесков, {len(burst_alert_cooldown)} записей cooldown")
+    except Exception as e:
+        log.error(f"Не удалось загрузить состояние из Redis: {e}")
+    _redis_loaded = True
+
+
+def redis_save_state() -> None:
+    """Сохраняет текущее burst_alerted_syms и burst_alert_cooldown в Upstash Redis,
+    чтобы они переживали следующий перезапуск процесса."""
+    if not _redis_configured():
+        return
+    try:
+        import json as _json
+        alerted_json = _json.dumps(list(burst_alerted_syms))
+        cooldown_json = _json.dumps(burst_alert_cooldown)
+        requests.post(f"{UPSTASH_REDIS_URL}/set/{REDIS_KEY_ALERTED}", headers=_redis_headers(), json=alerted_json, timeout=10)
+        requests.post(f"{UPSTASH_REDIS_URL}/set/{REDIS_KEY_COOLDOWN}", headers=_redis_headers(), json=cooldown_json, timeout=10)
+    except Exception as e:
+        log.error(f"Не удалось сохранить состояние в Redis: {e}")
 
 
 def fetch_tickers() -> dict[str, dict]:
@@ -211,6 +272,7 @@ def run_cycle() -> None:
         time.sleep(0.05)
 
     burst_alerted_syms = new_burst_syms
+    redis_save_state()
     summary = f"Проверено {len(candidates)} монет, активных всплесков: {len(new_burst_syms)} ({', '.join(sorted(new_burst_syms)) or '—'})"
     log.info(f"Цикл завершён. {summary}")
     last_cycle_summary = summary
@@ -224,6 +286,10 @@ def background_loop() -> None:
             "TG_BOT_TOKEN или TG_CHAT_ID не заданы! "
             "Бот будет работать, но алерты не отправятся. См. README.md."
         )
+
+    # Загружаем состояние дедупликации из Redis ДО первого цикла — иначе первый цикл
+    # после перезапуска решит, что все текущие всплески новые, и зашлёт повторные алерты
+    redis_load_state()
 
     while True:
         start = time.time()
@@ -248,9 +314,11 @@ app = Flask(__name__)
 @app.route("/")
 def health_check():
     tg_status = "настроен" if (TG_BOT_TOKEN and TG_CHAT_ID) else "НЕ настроен (проверь переменные окружения)"
+    redis_status = "настроен (алерты переживут перезапуск)" if _redis_configured() else "НЕ настроен (после перезапуска возможны повторные алерты — см. README.md)"
     return (
         f"CryptoScan Burst Bot работает.\n"
         f"Telegram: {tg_status}\n"
+        f"Redis (персистентность): {redis_status}\n"
         f"Последний цикл: {last_cycle_summary}\n"
     )
 
