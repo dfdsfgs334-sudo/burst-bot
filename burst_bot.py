@@ -265,7 +265,14 @@ def run_cycle() -> None:
             cooled_down = last_alert is None or (now - last_alert) >= ALERT_COOLDOWN_SEC
 
             if not was_already and cooled_down:
+                # Сразу записываем cooldown и алертед-статус в локальный кэш и в Redis
+                # ДО отправки сообщения — это минимизирует (хотя не гарантированно
+                # исключает на 100%, без поддержки распределённых локов Redis) окно
+                # гонки, в котором два параллельных процесса могли бы оба решить, что
+                # алерт по этой монете ещё не отправлялся.
                 burst_alert_cooldown[sym] = now
+                burst_alerted_syms.add(sym)
+                redis_save_state()
                 send_telegram_alert(sym, coin, burst_count)
 
         # Небольшая пауза между запросами, чтобы не упереться в rate limit Binance
@@ -329,4 +336,10 @@ if __name__ == "__main__":
     worker_thread.start()
 
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    # debug=False и use_reloader=False — критично: иначе werkzeug может форкнуть
+    # дочерний процесс, который снова выполнит весь скрипт с нуля (включая создание
+    # ВТОРОГО worker_thread). Тогда два независимых цикла проверки будут читать/писать
+    # в Redis почти одновременно, и оба могут отправить алерт по одной и той же монете
+    # до того как другой успеет обновить состояние — именно это вызывало дублирующиеся
+    # алерты, приходящие кластерами с разницей в секунды.
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
